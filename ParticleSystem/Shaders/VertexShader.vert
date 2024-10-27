@@ -1,8 +1,7 @@
 #version 440 core
 
-layout(location=0) in vec4 point[2];
-layout(location=0, component=0) in vec4 pos;
-layout(location=1, component=0) in vec4 in_color;
+layout(location=0) in vec4 pos;
+layout(location=1) in vec4 in_color;
 
 layout(location=4) out vec4 color;
 layout(location=28) uniform mat4 u_ViewProjection;

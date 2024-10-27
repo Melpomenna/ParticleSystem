@@ -20,8 +20,8 @@
 
 #include <freetype/freetype.h>
 
-#define POINTS_PER_CLICK 1024
-#define DEFAULT_POINT_SPEED	50
+#define POINTS_PER_CLICK 512
+#define DEFAULT_POINT_SPEED 75
 
 struct RGBAColor final
 {
@@ -54,7 +54,7 @@ struct Vector2D final
 struct Point2D final
 {
 	Point2D(Position2D pos, RGBAColor color, size_t idx, Vector2D speed) noexcept : color(color), pos(pos), idx(idx),
-		speed(speed), dt(0)
+		speed(speed), dt(0), deadFlag(false)
 	{
 	}
 
@@ -63,8 +63,8 @@ struct Point2D final
 	size_t idx;
 	Vector2D speed;
 	double dt;
+	bool deadFlag;
 };
-
 
 class Timer
 {
@@ -106,6 +106,100 @@ void BindPoints(GLuint, GLuint) noexcept;
 char* ReadShader(const char*) noexcept;
 void DrawText(const std::string&, GLuint, GLuint, GLuint, const std::unordered_map<unsigned char, Character>&,
               glm::vec4, Position2D);
+
+class PointVector
+{
+public:
+	PointVector() : points_(nullptr), size_(0), capacity_(0)
+	{
+	}
+
+	~PointVector()
+	{
+		allocator_.deallocate(points_, capacity_.load());
+	}
+
+	template <class... Args>
+	void EmplaceBack(Args&&... args)
+	{
+		if (!points_)
+		{
+			points_ = allocator_.allocate(capacity_.load());
+		}
+
+		if (size_ == capacity_)
+		{
+			capacity_.store(capacity_.load() * 2);
+			Point2D* ptr = allocator_.allocate(capacity_.load());
+			memcpy(ptr, points_, size_.load() * sizeof(Point2D));
+			allocator_.deallocate(points_, capacity_.load());
+			points_ = ptr;
+		}
+		Point2D point{std::forward<Args>(args)...};
+		allocator_.construct(points_ + size_.load(), point);
+		size_.fetch_add(1);
+	}
+
+	void Erase(const size_t from, const size_t to, const size_t deadCount)
+	{
+		if (static_cast<int>(size_.load()) - static_cast<int>(deadCount) < 0)
+		{
+			size_.store(0);
+			return;
+		}
+		qsort(points_, to - from + 1, sizeof(Point2D), [](const void* lhs, const void*)
+		{
+			if (*static_cast<const bool*>(lhs))
+			{
+				return 1;
+			}
+			return -1;
+		});
+		size_.fetch_sub(deadCount);
+	}
+
+	Point2D& operator[](const size_t idx) noexcept
+	{
+		return points_[idx];
+	}
+
+	const Point2D& operator[](const size_t idx) const noexcept
+	{
+		return points_[idx];
+	}
+
+	void PushBack(const Point2D& point)
+	{
+		EmplaceBack(point);
+	}
+
+	void Reserve(const size_t size)
+	{
+		points_ = allocator_.allocate(size);
+		capacity_ = size;
+	}
+
+	size_t Size() const noexcept
+	{
+		return size_.load();
+	}
+
+	Point2D* Data() noexcept
+	{
+		return points_;
+	}
+
+	const Point2D* Data() const noexcept
+	{
+		return points_;
+	}
+
+private:
+	std::allocator<Point2D> allocator_;
+	Point2D* points_;
+	std::atomic<size_t> size_;
+	std::atomic<size_t> capacity_;
+};
 
 template <class T>
 class UnboundingMPMCQueue
@@ -226,7 +320,7 @@ private:
 
 namespace
 {
-	std::vector<Point2D> POINTS = {};
+	PointVector POINTS = {};
 	std::mt19937_64 GENERATOR;
 
 	std::condition_variable NOT_CREATED_POINTS = {};
@@ -236,13 +330,14 @@ namespace
 	std::unique_ptr<Timer> TIMER;
 
 	std::atomic<bool> IS_RUNNING = false;
-	StaticThreadPool<2> POOL;
+	std::atomic<size_t> POINTS_COUNT = 0;
+	StaticThreadPool<20> POOL;
 }
 
 int main()
 {
 	IS_RUNNING = false;
-	POINTS.reserve(POINTS_PER_CLICK * POINTS_PER_CLICK);
+	POINTS.Reserve(POINTS_PER_CLICK * POINTS_PER_CLICK);
 
 	POOL.Push(CreatePointsThread);
 
@@ -468,9 +563,9 @@ int main()
 		glUseProgram(shaderProgram);
 
 		BindPoints(vbo, vao);
-		glDrawArrays(GL_POINTS, 0, POINTS.size());
+		glDrawArrays(GL_POINTS, 0, POINTS.Size());
 
-		text = "Points Count:" + std::to_string(POINTS.size());
+		text = "Points Count:" + std::to_string(POINTS.Size());
 		DrawText(text, textShaderProgram, textVBO, textVAO, characters, {1, 1, 1, 1}, {-width, height - 100});
 
 		glfwSwapBuffers(window);
@@ -519,7 +614,7 @@ void BindPoints(const GLuint vbo, const GLuint vao) noexcept
 
 	glBindBuffer(GL_ARRAY_BUFFER, vbo);
 
-	glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(POINTS.size() * sizeof(Point2D)), POINTS.data(),
+	glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(POINTS.Size() * sizeof(Point2D)), POINTS.Data(),
 	             GL_DYNAMIC_DRAW);
 
 
@@ -557,17 +652,22 @@ void CreatePointsThread() noexcept
 		}
 
 
+		std::unique_lock<std::mutex> lock{CREATE_POINTS_MT};
 		for (auto i = 0; i < POINTS_PER_CLICK; ++i)
 		{
-			std::unique_lock<std::mutex> lock{CREATE_POINTS_MT};
-			POINTS.emplace_back(pos, RGBAColor(static_cast<float>(GENERATOR() % 255) / 255.0f,
-			                                   static_cast<float>(GENERATOR() % 255) / 255.0f,
-			                                   static_cast<float>(GENERATOR() % 255) / 255.0f,
-			                                   static_cast<float>(GENERATOR() % 255) / 255.0f),
-			                    POINTS.size(), Vector2D{
-				                    DEFAULT_POINT_SPEED / 2.0f + GENERATOR() % DEFAULT_POINT_SPEED,
-				                    DEFAULT_POINT_SPEED / 2.0f + GENERATOR() % DEFAULT_POINT_SPEED
-			                    });
+			POINTS.EmplaceBack(pos, RGBAColor(static_cast<float>(GENERATOR() % 255) / 255.0f,
+			                                  static_cast<float>(GENERATOR() % 255) / 255.0f,
+			                                  static_cast<float>(GENERATOR() % 255) / 255.0f,
+			                                  static_cast<float>(GENERATOR() % 255) / 255.0f),
+			                   POINTS_COUNT.load(), Vector2D{
+				                   DEFAULT_POINT_SPEED / 2.0f + GENERATOR() % DEFAULT_POINT_SPEED,
+				                   DEFAULT_POINT_SPEED / 2.0f + GENERATOR() % DEFAULT_POINT_SPEED
+			                   });
+			POINTS_COUNT.fetch_add(1);
+		}
+		if (POINTS_COUNT.load() >= POINTS_PER_CLICK * POINTS_PER_CLICK)
+		{
+			POINTS_COUNT.store(0);
 		}
 	}
 }
@@ -595,18 +695,23 @@ void PhysicsThread(const float w, const float h, const int id) noexcept
 
 	while (IS_RUNNING)
 	{
-		const auto shift = POINTS.size() / workersCount;
+		const auto shift = POINTS.Size() / workersCount;
 		const size_t from = id * shift;
 		const size_t to = shift + from;
 
-
-		std::queue<size_t> erased;
 		const float dt = static_cast<float>(TIMER->Peek());
 
-		for (size_t i = from; i < to && i < POINTS.size(); ++i)
+		size_t deadPoints = 0;
+
+		for (size_t i = from; i < to && i < POINTS.Size(); ++i)
 		{
 			auto& point = POINTS[i];
-			const auto idx = point.idx % POINTS_PER_CLICK;
+			if (point.deadFlag)
+			{
+				deadPoints++;
+				continue;
+			}
+			const auto idx = i % POINTS_PER_CLICK;
 
 			const float time = static_cast<float>(point.dt * point.dt);
 			point.pos.y += sinValues[idx] * point.speed.y * dt - 4.9f * time * dt;
@@ -614,24 +719,19 @@ void PhysicsThread(const float w, const float h, const int id) noexcept
 
 			point.dt += dt;
 
-			if (point.pos.x >= w || point.pos.y >= h || point.pos.x <= -w || point.pos.y <= -h)
+			if (point.pos.x > w || point.pos.y > h || point.pos.x < -w || point.pos.y < -h)
 			{
-				erased.push(i);
+				point.deadFlag = true;
+				++deadPoints;
 			}
 		}
 
-		size_t shiftErased = 0;
-		while (!erased.empty())
+		if (deadPoints <= (to - from) / 2)
 		{
-			const auto idx = erased.front();
-			erased.pop();
-
-			{
-				std::unique_lock<std::mutex> lock{CREATE_POINTS_MT};
-				POINTS.erase(POINTS.begin() + static_cast<decltype(POINTS)::difference_type>(idx - shiftErased));
-			}
-			++shiftErased;
+			continue;
 		}
+		std::unique_lock<std::mutex> lock{CREATE_POINTS_MT};
+		POINTS.Erase(from, to, deadPoints);
 	}
 }
 
